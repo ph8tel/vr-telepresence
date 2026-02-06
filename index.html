@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebXR Stereo WebRTC Viewer</title>
+<style>
+  body { font-family: Arial, sans-serif; padding: 20px; }
+  video { display:none; }
+  #debugLog { 
+    border: 2px solid #333; 
+    background: #f0f0f0; 
+    padding: 10px; 
+    margin-top: 20px;
+    max-height: 300px;
+    overflow-y: auto;
+    font-family: monospace;
+    font-size: 14px;
+    white-space: pre-wrap;
+  }
+  .error { color: red; font-weight: bold; }
+  .success { color: green; }
+  .info { color: blue; }
+</style>
+</head>
+<body>
+
+<button id="enterVR" style="font-size: 18px; padding: 15px 30px; cursor: pointer;">Enter VR</button>
+<button id="testView" style="font-size: 18px; padding: 15px 30px; cursor: pointer;">Test View (No VR)</button>
+<div id="testContainer" style="display:none;">
+  <video id="leftVideo" controls autoplay playsinline muted style="width:50%;display:inline-block;"></video>
+  <video id="rightVideo" controls autoplay playsinline muted style="width:50%;display:inline-block;"></video>
+</div>
+
+<p id="vrStatus" style="margin-top: 20px; font-size: 16px; color: #666;"></p>
+
+<div id="debugLog">
+  <strong>Debug Log:</strong><br>
+  Page loaded...<br>
+</div>
+
+<script>
+// Debug logging to page
+function logToPage(message, type = 'info') {
+    const log = document.getElementById('debugLog');
+    const timestamp = new Date().toLocaleTimeString();
+    const className = type; // 'error', 'success', 'info'
+    log.innerHTML += `<span class="${className}">[${timestamp}] ${message}</span><br>`;
+    log.scrollTop = log.scrollHeight;
+    console.log(`[${type}] ${message}`);
+}
+
+// Override console methods
+const originalError = console.error;
+console.error = function(...args) {
+    logToPage(args.join(' '), 'error');
+    originalError.apply(console, args);
+};
+
+// -------------------------------
+// 1. WebRTC: receive two tracks + send pose data
+// -------------------------------
+const pc = new RTCPeerConnection({
+    iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { 
+            urls: 'turn:openrelay.metered.ca:80',
+            username: 'openrelayproject',
+            credential: 'openrelayproject'
+        },
+        { 
+            urls: 'turn:openrelay.metered.ca:443',
+            username: 'openrelayproject',
+            credential: 'openrelayproject'
+        }
+    ],
+    iceCandidatePoolSize: 10
+});
+
+// Data channel will be received from server (server creates it with the offer)
+let dataChannel = null;
+let dataChannelReady = false;
+
+pc.ondatachannel = (event) => {
+    dataChannel = event.channel;
+    logToPage(`Data channel received from server: ${dataChannel.label}, state: ${dataChannel.readyState}`, "success");
+    
+    dataChannel.onopen = () => {
+        logToPage("Data channel opened - can send pose data", "success");
+        dataChannelReady = true;
+    };
+
+    dataChannel.onmessage = (event) => {
+        logToPage(`Server says: ${event.data}`, "info");
+    };
+
+    dataChannel.onclose = () => {
+        logToPage("Data channel closed", "info");
+        dataChannelReady = false;
+    };
+
+    dataChannel.onerror = (error) => {
+        logToPage(`Data channel error: ${error}`, "error");
+        dataChannelReady = false;
+    };
+};
+
+let leftStream = null;
+let rightStream = null;
+
+pc.oniceconnectionstatechange = () => {
+    logToPage(`ICE connection state: ${pc.iceConnectionState}`, "info");
+};
+
+pc.onconnectionstatechange = () => {
+    logToPage(`Connection state: ${pc.connectionState}`, "info");
+};
+
+pc.ontrack = (event) => {
+    logToPage(`Received track: ${event.track.kind} readyState: ${event.track.readyState}`, "success");
+    
+    const track = event.track;
+    track.onended = () => logToPage(`Track ended: ${track.kind}`, "info");
+    track.onmute = () => logToPage(`Track muted: ${track.kind}`, "error");
+    track.onunmute = () => logToPage(`Track unmuted: ${track.kind}`, "success");
+    
+    if (!leftStream) {
+        // First track = left camera
+        leftStream = new MediaStream([track]);
+        const vid = document.getElementById("leftVideo");
+        vid.srcObject = leftStream;
+        vid.play().catch(e => logToPage(`Left play error: ${e.message}`, "error"));
+        logToPage("Left video stream attached", "success");
+    } else if (!rightStream) {
+        // Second track = right camera
+        rightStream = new MediaStream([track]);
+        const vid = document.getElementById("rightVideo");
+        vid.srcObject = rightStream;
+        vid.play().catch(e => logToPage(`Right play error: ${e.message}`, "error"));
+        logToPage("Right video stream attached", "success");
+    }
+};
+
+let iceCandidates = [];
+
+pc.onicecandidate = (event) => {
+    if (event.candidate) {
+        iceCandidates.push(event.candidate);
+    } else {
+        logToPage(`ICE gathering complete, total candidates: ${iceCandidates.length}`, "info");
+    }
+};
+
+async function start() {
+    try {
+        logToPage("Requesting offer from server...", "info");
+        const response = await fetch("/offer", {
+            method: "POST",
+            body: JSON.stringify({}),
+            headers: { "Content-Type": "application/json" }
+        });
+
+        const offer = await response.json();
+        logToPage(`Received offer, setting remote description...`, "info");
+        await pc.setRemoteDescription(offer);
+        
+        logToPage("Creating answer...", "info");
+        const answer = await pc.createAnswer();
+        
+        // Check if data channel is in the SDP
+        const hasDataChannel = answer.sdp.includes('m=application');
+        logToPage(`Answer SDP includes data channel: ${hasDataChannel}`, hasDataChannel ? "success" : "error");
+        if (hasDataChannel) {
+            logToPage("Data channel SCTP port found in SDP", "success");
+        } else {
+            logToPage("WARNING: Data channel NOT in SDP - negotiation problem!", "error");
+        }
+        
+        await pc.setLocalDescription(answer);
+        
+        await fetch("/answer", {
+            method: "POST",
+            body: JSON.stringify({
+                sdp: pc.localDescription.sdp,
+                type: pc.localDescription.type
+            }),
+            headers: { "Content-Type": "application/json" }
+        });
+        
+        logToPage("WebRTC signaling complete", "success");
+    } catch (e) {
+        logToPage(`WebRTC error: ${e.message}`, "error");
+    }
+}
+
+start();
+
+// -------------------------------
+// Test view button
+// -------------------------------
+window.addEventListener('DOMContentLoaded', () => {
+    const testBtn = document.getElementById("testView");
+    const container = document.getElementById("testContainer");
+    
+    testBtn.onclick = () => {
+        logToPage("Test view clicked", "info");
+        container.style.display = container.style.display === "none" ? "block" : "none";
+    };
+});
+
+// -------------------------------
+// 3. WebXR setup
+// -------------------------------
+let xrSession = null;
+let gl = null;
+let xrRefSpace = null;
+let shaderProgram = null;
+let quadBuffer = null;
+
+const canvas = document.createElement("canvas");
+const glAttribs = { alpha: false, antialias: false };
+
+function initWebGL() {
+    const vertexShaderSource = `
+        attribute vec2 aPosition;
+        varying vec2 vTexCoord;
+        void main() {
+            vTexCoord = aPosition * 0.5 + 0.5;
+            gl_Position = vec4(aPosition, 0.0, 1.0);
+        }
+    `;
+    
+    const fragmentShaderSource = `
+        precision mediump float;
+        varying vec2 vTexCoord;
+        uniform sampler2D uTexture;
+        uniform float uIPDOffset;
+        void main() {
+            vec2 adjustedCoord = vTexCoord;
+            adjustedCoord.x += uIPDOffset;
+            gl_FragColor = texture2D(uTexture, adjustedCoord);
+        }
+    `;
+    
+    const vertexShader = gl.createShader(gl.VERTEX_SHADER);
+    gl.shaderSource(vertexShader, vertexShaderSource);
+    gl.compileShader(vertexShader);
+    if (!gl.getShaderParameter(vertexShader, gl.COMPILE_STATUS)) {
+        logToPage(`Vertex shader error: ${gl.getShaderInfoLog(vertexShader)}`, "error");
+        return false;
+    }
+    
+    const fragmentShader = gl.createShader(gl.FRAGMENT_SHADER);
+    gl.shaderSource(fragmentShader, fragmentShaderSource);
+    gl.compileShader(fragmentShader);
+    if (!gl.getShaderParameter(fragmentShader, gl.COMPILE_STATUS)) {
+        logToPage(`Fragment shader error: ${gl.getShaderInfoLog(fragmentShader)}`, "error");
+        return false;
+    }
+    
+    shaderProgram = gl.createProgram();
+    gl.attachShader(shaderProgram, vertexShader);
+    gl.attachShader(shaderProgram, fragmentShader);
+    gl.linkProgram(shaderProgram);
+    if (!gl.getProgramParameter(shaderProgram, gl.LINK_STATUS)) {
+        logToPage(`Shader link error: ${gl.getProgramInfoLog(shaderProgram)}`, "error");
+        return false;
+    }
+    
+    const quadVertices = new Float32Array([
+        -1, -1,
+         1, -1,
+        -1,  1,
+         1,  1
+    ]);
+    quadBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, quadVertices, gl.STATIC_DRAW);
+    
+    logToPage("WebGL shaders initialized with IPD adjustment", "success");
+    return true;
+}
+
+function startVRSession() {
+    logToPage("startVRSession() called", "info");
+    
+    if (!navigator.xr) {
+        const msg = `WebXR not supported. navigator.xr is undefined. Browser: ${navigator.userAgent}`;
+        logToPage(msg, "error");
+        alert(msg);
+        return;
+    }
+    
+    logToPage("Requesting VR session directly (user gesture)...", "success");
+
+    // Must call requestSession synchronously within user gesture handler
+    navigator.xr.requestSession("immersive-vr", {
+        optionalFeatures: ["local-floor"]
+    }).then(session => {
+        xrSession = session;
+        logToPage("VR session created successfully!", "success");
+        
+        gl = canvas.getContext("webgl", glAttribs);
+        
+        if (!initWebGL()) {
+            logToPage("WebGL initialization failed!", "error");
+            alert("WebGL initialization failed. Check debug log.");
+            return;
+        }
+        
+        logToPage("WebGL initialized successfully", "success");
+        
+        return xrSession.updateRenderState({
+            baseLayer: new XRWebGLLayer(xrSession, gl)
+        });
+    }).then(() => {
+        return xrSession.requestReferenceSpace("local-floor");
+    }).then(refSpace => {
+        xrRefSpace = refSpace;
+        
+        xrSession.onend = () => {
+            logToPage("VR session ended", "info");
+            xrSession = null;
+        };
+        
+        xrSession.requestAnimationFrame(onXRFrame);
+        logToPage("VR session started - rendering frames!", "success");
+    }).catch(e => {
+        const msg = `VR session request failed: ${e.message}\nName: ${e.name}`;
+        logToPage(msg, "error");
+        alert("VR Error: " + e.message);
+    });
+}
+
+// Main button handler - direct call preserves user gesture
+document.getElementById("enterVR").onclick = (e) => {
+    e.preventDefault();
+    logToPage("Enter VR button clicked", "info");
+    startVRSession();
+};
+
+// Auto-start VR when in headset
+logToPage(`User Agent: ${navigator.userAgent}`, "info");
+logToPage(`Platform: ${navigator.platform}`, "info");
+logToPage(`navigator.xr exists: ${!!navigator.xr}`, navigator.xr ? "success" : "error");
+
+if (navigator.xr) {
+    logToPage("navigator.xr detected, checking support...", "info");
+    navigator.xr.isSessionSupported("immersive-vr").then((supported) => {
+        if (supported) {
+            logToPage("VR headset detected and supported!", "success");
+            document.getElementById("vrStatus").textContent = "VR Ready! Click 'Enter VR' button or use controller trigger.";
+            document.getElementById("enterVR").style.fontSize = "24px";
+            document.getElementById("enterVR").style.padding = "20px 40px";
+        } else {
+            logToPage("VR not supported by this device", "error");
+            document.getElementById("vrStatus").textContent = "VR not available. Use 'Test View' to see video streams.";
+        }
+    }).catch(e => {
+        logToPage(`Error checking VR support: ${e.message}`, "error");
+    });
+} else {
+    logToPage("navigator.xr is undefined - WebXR not available", "error");
+    logToPage("SOLUTION: For Quest Pro, you need:", "info");
+    logToPage("1. Use the built-in Meta Quest Browser (not Wolvic)", "info");
+    logToPage("2. Access via HTTPS (not HTTP), or", "info");
+    logToPage("3. Open in VR mode: Menu > Browser > Enter VR", "info");
+    document.getElementById("vrStatus").innerHTML = `
+        <strong style="color: red;">WebXR Not Available</strong><br>
+        For Quest Pro:<br>
+        1. Use Meta Quest Browser (built-in)<br>
+        2. Serve page via HTTPS, OR<br>
+        3. Click the VR button in browser menu<br>
+        <br>
+        For now, use 'Test View' to see stereo video.
+    `;
+}
+
+// Remove auto-start - WebXR requires explicit user gesture
+logToPage("Event listeners registered - click Enter VR button to start", "success");
+
+// -------------------------------
+// 4. WebGL textures for each eye
+// -------------------------------
+let leftTex = null;
+let rightTex = null;
+
+function createTextureForVideo(video) {
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    return tex;
+}
+
+// -------------------------------
+// 5. XR frame loop (runs at 72–120 Hz)
+// -------------------------------
+let xrFrameCount = 0;
+let controllerFrameCount = 0;
+
+function onXRFrame(t, frame) {
+    xrSession.requestAnimationFrame(onXRFrame);
+    const pose = frame.getViewerPose(xrRefSpace);
+    if (!pose) return;
+    
+    xrFrameCount++;
+    if (xrFrameCount === 1) {
+        logToPage("XR frame loop started - first frame rendered", "success");
+    }
+    
+    // Send head tracking data every frame
+    sendPoseDataToPi(pose);
+    
+    // Send controller data every 3rd frame (~24-40Hz to reduce bandwidth)
+    controllerFrameCount++;
+    if (controllerFrameCount % 3 === 0) {
+        sendControllerData(xrSession.inputSources);
+    }
+    
+    const glLayer = xrSession.renderState.baseLayer;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, glLayer.framebuffer);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    
+    if (!leftTex && leftStream) {
+        leftTex = createTextureForVideo(document.getElementById("leftVideo"));
+        logToPage("Created left eye texture", "success");
+    }
+    
+    if (!rightTex && rightStream) {
+        rightTex = createTextureForVideo(document.getElementById("rightVideo"));
+        logToPage("Created right eye texture", "success");
+    }
+    
+    gl.useProgram(shaderProgram);
+    const positionLoc = gl.getAttribLocation(shaderProgram, "aPosition");
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+    gl.enableVertexAttribArray(positionLoc);
+    gl.vertexAttribPointer(positionLoc, 2, gl.FLOAT, false, 0, 0);
+    
+    const textureLoc = gl.getUniformLocation(shaderProgram, "uTexture");
+    const ipdOffsetLoc = gl.getUniformLocation(shaderProgram, "uIPDOffset");
+    
+    // IPD adjustment: OAK-Pro baseline = 75mm, User IPD = 71mm, difference = 4mm
+    // Shift each eye inward by 2.67% of frame width (4mm / 75mm / 2)
+    const ipdAdjustment = 0.0267;
+    
+    for (const view of pose.views) {
+        const viewport = glLayer.getViewport(view);
+        gl.viewport(viewport.x, viewport.y, viewport.width, viewport.height);
+        
+        const video = (view.eye === "left")
+            ? document.getElementById("leftVideo")
+            : document.getElementById("rightVideo");
+            
+        const tex = (view.eye === "left") ? leftTex : rightTex;
+        
+        // Apply IPD offset: left eye shifts right (+), right eye shifts left (-)
+        const offset = (view.eye === "left") ? ipdAdjustment : -ipdAdjustment;
+        
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.texImage2D(
+            gl.TEXTURE_2D,
+            0,
+            gl.RGBA,
+            gl.RGBA,
+            gl.UNSIGNED_BYTE,
+            video
+        );
+        gl.uniform1i(textureLoc, 0);
+        gl.uniform1f(ipdOffsetLoc, offset);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    }
+}
+
+// Function to send pose data to Raspberry Pi 5 via WebRTC data channel
+let poseFrameCount = 0;
+let lastPoseLogTime = 0;
+
+function sendPoseDataToPi(pose) {
+    poseFrameCount++;
+    
+    // Log status every 2 seconds
+    const now = Date.now();
+    if (now - lastPoseLogTime > 2000) {
+        if (!dataChannel) {
+            logToPage("Pose data: data channel is null!", "error");
+        } else if (dataChannel.readyState !== 'open') {
+            logToPage(`Pose data: channel state is '${dataChannel.readyState}' (need 'open')`, "error");
+        } else {
+            logToPage(`Pose data flowing: ${poseFrameCount} frames sent`, "success");
+        }
+        lastPoseLogTime = now;
+        poseFrameCount = 0;
+    }
+    
+    // Only send if data channel is open
+    if (!dataChannel || dataChannel.readyState !== 'open') {
+        return;
+    }
+    
+    // Send head tracking data (pose message type)
+    const poseMessage = {
+        type: "pose",
+        timestamp: Date.now(),
+        position: {
+            x: pose.transform.position.x,
+            y: pose.transform.position.y,
+            z: pose.transform.position.z
+        },
+        orientation: {
+            x: pose.transform.orientation.x,
+            y: pose.transform.orientation.y,
+            z: pose.transform.orientation.z,
+            w: pose.transform.orientation.w
+        }
+    };
+    
+    try {
+        dataChannel.send(JSON.stringify(poseMessage));
+    } catch (e) {
+        logToPage(`Failed to send pose data: ${e.message}`, "error");
+    }
+}
+
+function sendControllerData(inputSources) {
+    if (!dataChannel || dataChannel.readyState !== 'open') {
+        return;
+    }
+    
+    const controllerMessage = {
+        type: "controller",
+        timestamp: Date.now(),
+        leftJoystick: { x: 0, y: 0 },
+        rightJoystick: { x: 0, y: 0 },
+        buttons: {}
+    };
+    
+    // Read controller inputs
+    for (const inputSource of inputSources) {
+        if (inputSource.gamepad) {
+            const gamepad = inputSource.gamepad;
+            const handedness = inputSource.handedness; // 'left' or 'right'
+            
+            // Axes (joysticks): axes[2] = x-axis, axes[3] = y-axis (standard mapping)
+            if (gamepad.axes.length >= 4) {
+                if (handedness === 'left') {
+                    controllerMessage.leftJoystick.x = gamepad.axes[2];
+                    controllerMessage.leftJoystick.y = -gamepad.axes[3]; // Invert Y for forward=positive
+                } else if (handedness === 'right') {
+                    controllerMessage.rightJoystick.x = gamepad.axes[2];
+                    controllerMessage.rightJoystick.y = -gamepad.axes[3];
+                }
+            }
+            
+            // Buttons (index mapping for Quest Pro controllers)
+            // Button 0: Trigger
+            // Button 1: Grip
+            // Button 4: A/X button
+            // Button 5: B/Y button
+            if (gamepad.buttons[0] && gamepad.buttons[0].pressed) {
+                controllerMessage.buttons[`${handedness}_trigger`] = true;
+            }
+            if (gamepad.buttons[1] && gamepad.buttons[1].pressed) {
+                controllerMessage.buttons[`${handedness}_grip`] = true;
+            }
+            if (gamepad.buttons[4] && gamepad.buttons[4].pressed) {
+                // Map to plow controls
+                controllerMessage.buttons['plow_up'] = true;
+            }
+            if (gamepad.buttons[5] && gamepad.buttons[5].pressed) {
+                controllerMessage.buttons['plow_down'] = true;
+            }
+            
+            // Example: Right grip = lights toggle
+            if (handedness === 'right' && gamepad.buttons[1] && gamepad.buttons[1].pressed) {
+                controllerMessage.buttons['lights'] = true;
+            }
+            
+            // Example: Left grip = horn
+            if (handedness === 'left' && gamepad.buttons[1] && gamepad.buttons[1].pressed) {
+                controllerMessage.buttons['horn'] = true;
+            }
+        }
+    }
+    
+    try {
+        dataChannel.send(JSON.stringify(controllerMessage));
+    } catch (e) {
+        console.error(`Failed to send controller data: ${e.message}`);
+    }
+}
+</script>
+</body>
+</html>
