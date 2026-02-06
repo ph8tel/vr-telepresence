@@ -1,241 +1,73 @@
-# server.py
-
 import asyncio
+import json
 import cv2
-import fractions
+import numpy as np
 from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
 from aiohttp import web
-import numpy as np
 from stereo_camera import StereoCamera
+import av
+import time
 
-# -----------------------------
-# Custom Video Track for WebRTC
-# -----------------------------
-class CameraTrack(VideoStreamTrack):
-    def __init__(self, stereo_cam, side="left"):
+
+class StereoStreamTrack(VideoStreamTrack):
+    kind = "video"
+
+    def __init__(self, camera, eye):
         super().__init__()
-        self.stereo_cam = stereo_cam
-        self.side = side
-        self.frame_count = 0
-        self._timestamp = 0
-        self._start = None
-        print(f"CameraTrack created: {side}")
+        self.camera = camera
+        self.eye = eye  # "left" or "right"
 
     async def recv(self):
-        self.frame_count += 1
-        if self.frame_count == 1:
-            print(f"{self.side} track: recv() called for first time!")
-            
-        # Small delay to control frame rate (~30fps)
-        await asyncio.sleep(1/30)
-        
-        try:
-            frameL, frameR = self.stereo_cam.get_frames()
-            frame = frameL if self.side == "left" else frameR
-            
-            # PiCamera2 outputs RGB, need to convert to BGR for av.VideoFrame
-            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            
-                
-        except Exception as e:
-            print(f"CameraTrack frame capture error ({self.side}):", e)
-            import traceback
-            traceback.print_exc()
-            raise
+        frame_left, frame_right = self.camera.get_frames()
 
-        try:
-            from av import VideoFrame
-            video_frame = VideoFrame.from_ndarray(frame_bgr, format="bgr24")
-            
-            # Manual timestamp management (90kHz clock for video)
-            video_frame.pts = self._timestamp
-            self._timestamp += int(90000 / 30)  # 30 fps
-            video_frame.time_base = fractions.Fraction(1, 90000)
-            
-            return video_frame
-        except Exception as e:
-            print(f"CameraTrack VideoFrame creation error ({self.side}):", e)
-            import traceback
-            traceback.print_exc()
-            raise
+        if frame_left is None:
+            await asyncio.sleep(0.001)
+            return await self.recv()
 
+        frame = frame_left if self.eye == "left" else frame_right
 
-# -----------------------------
-# WebRTC Signaling Server
-# -----------------------------
-pcs = set()
-stereo_cam = StereoCamera(size=(1280, 720))
+        # Convert RGB → BGR for OpenCV → then to VideoFrame
+        bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        video_frame = av.VideoFrame.from_ndarray(bgr, format="bgr24")
+        video_frame.pts = time.time_ns() // 1000
+        video_frame.time_base = 1 / 1_000_000
 
-# Store the most recent peer connection for answer endpoint
-_current_pc = None
+        return video_frame
 
-# TCP connection to Pi 4 servo controller
-servo_writer = None
-servo_lock = asyncio.Lock()
-
-async def connect_to_servo_controller(host='192.168.1.79', port=9090):
-    """Connect to Pi 4 servo controller (non-blocking, optional)"""
-    global servo_writer
-    try:
-        print(f"Attempting to connect to servo controller at {host}:{port}...")
-        reader, writer = await asyncio.open_connection(host, port)
-        servo_writer = writer
-        print(f"✓ Connected to servo controller at {host}:{port}")
-        return True
-    except Exception as e:
-        print(f"✗ Could not connect to servo controller at {host}:{port}")
-        print(f"  Error: {type(e).__name__}: {e}")
-        print("  Continuing without servo control (pose data will be logged only)")
-        return False
-
-async def send_pose_to_servo(pose_json):
-    """Send pose data to Pi 4 servo controller (non-blocking)"""
-    global servo_writer
-    if not servo_writer:
-        
-        return  # Silently skip if not connected
-    
-    async with servo_lock:
-        try:
-            # Send JSON with newline delimiter
-            servo_writer.write((pose_json + '\n').encode('utf-8'))
-            await servo_writer.drain()
-        except Exception as e:
-            print(f"Error sending to servo controller: {e}")
-            servo_writer = None  # Reset on error
 
 async def offer(request):
-    global _current_pc
-    # CORS header for actual POST response
-    headers = {"Access-Control-Allow-Origin": "*"}
+    params = await request.json()
+    offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
 
     pc = RTCPeerConnection()
-    pcs.add(pc)
-    _current_pc = pc
 
-    @pc.on("connectionstatechange")
-    async def on_connectionstatechange():
-        print(f"Connection state: {pc.connectionState}")
-        
+    # Create camera
+    camera = StereoCamera()
+    camera.start()
+
+    # Add left and right tracks
+    pc.addTrack(StereoStreamTrack(camera, "left"))
+    pc.addTrack(StereoStreamTrack(camera, "right"))
+
     @pc.on("iceconnectionstatechange")
-    async def on_iceconnectionstatechange():
-        print(f"ICE connection state: {pc.iceConnectionState}")
+    def on_ice_state_change():
+        if pc.iceConnectionState == "failed":
+            camera.stop()
 
-    # Server creates data channel (since server creates offer)
-    data_channel = pc.createDataChannel("poseData", ordered=True, maxRetransmits=0)
-    print(f"[DATA CHANNEL] Created server-side channel: {data_channel.label}")
-    
-    @data_channel.on("message")
-    def on_data_message(message):
-        # Log first few characters to debug format
-        msg_preview = message[:100] if len(message) > 100 else message
-        print(f"[DATA CHANNEL] Received: {msg_preview}")
-        
-        # Forward to servo controller immediately (non-blocking)
-        asyncio.create_task(send_pose_to_servo(message))
-    
-    @data_channel.on("open")
-    def on_data_open():
-        print(f"[DATA CHANNEL] '{data_channel.label}' opened - ready to receive pose data!")
-        try:
-            data_channel.send('{"type":"ack","message":"Server ready to receive pose data"}')
-            print(f"[DATA CHANNEL] Sent ACK to client")
-        except Exception as e:
-            print(f"[DATA CHANNEL] Failed to send ACK: {e}")
-    
-    @data_channel.on("close")
-    def on_data_close():
-        print(f"[DATA CHANNEL] '{data_channel.label}' closed")
+    await pc.setRemoteDescription(offer)
+    answer = await pc.createAnswer()
+    await pc.setLocalDescription(answer)
 
-    # Server sends video, so server creates the offer
-    left_track = CameraTrack(stereo_cam, side="left")
-    right_track = CameraTrack(stereo_cam, side="right")
+    return web.Response(
+        content_type="application/json",
+        text=json.dumps(
+            {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
+        ),
+    )
 
-    # Add transceivers explicitly with sendonly direction
-    left_sender = pc.addTransceiver(left_track, direction="sendonly")
-    right_sender = pc.addTransceiver(right_track, direction="sendonly")
 
-    print(f"Added tracks via transceivers: left={left_track.kind}, right={right_track.kind}")
-
-    try:
-        # Server creates offer with tracks
-        offer = await pc.createOffer()
-        await pc.setLocalDescription(offer)
-        print("Offer created, waiting for answer...")
-        
-    except Exception as e:
-        print("Offer creation error:", e)
-        import traceback
-        traceback.print_exc()
-        return web.json_response({"error": str(e)}, headers=headers)
-
-    return web.json_response({
-        "sdp": pc.localDescription.sdp,
-        "type": pc.localDescription.type
-    }, headers=headers)
-
-async def answer(request):
-    global _current_pc
-    headers = {"Access-Control-Allow-Origin": "*"}
-    
-    if not _current_pc:
-        return web.json_response({"error": "No active peer connection"}, headers=headers)
-    
-    params = await request.json()
-    answer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
-    
-    try:
-        await _current_pc.setRemoteDescription(answer)
-        print("WebRTC connection established successfully")
-    except Exception as e:
-        print("Answer processing error:", e)
-        import traceback
-        traceback.print_exc()
-        return web.json_response({"error": str(e)}, headers=headers)
-    
-    return web.json_response({"status": "ok"}, headers=headers)
-
-async def on_startup(app):
-    # Connect to Pi 4 servo controller (optional, non-blocking)
-    await connect_to_servo_controller(host='192.168.1.138', port=9090)
-
-async def on_shutdown(app):
-    global servo_writer
-    # Close servo connection if open
-    if servo_writer:
-        servo_writer.close()
-        await servo_writer.wait_closed()
-    
-    for pc in pcs:
-        await pc.close()
-    stereo_cam.stop()
-# Add this BEFORE creating routes
-@web.middleware
-async def cors_middleware(request, handler):
-    if request.method == "OPTIONS":
-        return web.Response(headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type",
-        })
-
-    response = await handler(request)
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    return response
-
-app = web.Application(middlewares=[cors_middleware])
-
+app = web.Application()
 app.router.add_post("/offer", offer)
-app.router.add_post("/answer", answer)
-
-# Serve the HTML file at root
-app.router.add_get("/", lambda request: web.FileResponse("./index.html"))
-app.router.add_static("/", "./", show_index=False)
-
-app.on_startup.append(on_startup)
-app.on_shutdown.append(on_shutdown)
 
 if __name__ == "__main__":
-    # Use HTTP - Cloudflare Tunnel provides HTTPS
-    print("Starting HTTP server on port 8080 (Cloudflare Tunnel provides HTTPS)")
     web.run_app(app, port=8080)
